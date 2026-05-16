@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS votes (
 
 -- Admin user (password: Admin@1234)
 INSERT IGNORE INTO users (username, email, password, role, trust_score, reputation)
-VALUES ('admin','admin@truthortrap.id','$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TiGniMkPmTjMkO0aHsG7aF2mFXqC','admin',200,9999);
+VALUES ('admin','admin@truthortrap.id','$2a$12$Aznczv7AlMapZC23e5zWcezU3Ljoc0keOZOB7fu8aoCOOQE6fIGpO','admin',200,9999);
 
 -- ── Story Seed: "Gempa Digital - Divisi SIGMA" ────────────────────────────────
 INSERT IGNORE INTO scenarios (id, title, content, is_start) VALUES

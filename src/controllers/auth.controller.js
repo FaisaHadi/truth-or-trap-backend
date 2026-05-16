@@ -59,12 +59,14 @@ const login = async (req, res) => {
       'SELECT * FROM users WHERE email = ?',
       [email]
     );
+    
     if (rows.length === 0) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
     const user = rows[0];
     const match = await bcrypt.compare(password, user.password);
+    
     if (!match) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
