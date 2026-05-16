@@ -3,6 +3,9 @@ const cors = require('cors');
 const { apiLimiter } = require('./middleware/rateLimit.middleware');
 const app = express();
 
+// Trust proxy for Railway/production (IMPORTANT for rate limiting)
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(cors({
   origin: process.env.CLIENT_URL || 'http://localhost:3000',
