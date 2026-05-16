@@ -2,7 +2,12 @@ const bcrypt = require('bcryptjs');
 const jwt    = require('jsonwebtoken');
 const db     = require('../config/db');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'truth_or_trap_dev_secret';
+// CRITICAL: JWT_SECRET must be set in environment (no fallback!)
+if (!process.env.JWT_SECRET) {
+  throw new Error('CRITICAL: JWT_SECRET environment variable is required. Set it in .env file.');
+}
+
+const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
 // POST /api/auth/register

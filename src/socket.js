@@ -1,6 +1,7 @@
 const { Server } = require('socket.io');
 const jwt = require('jsonwebtoken');
 const db = require('./config/db');
+const { RoomStateManager, redlock } = require('./config/redis');
 
 const ROOM_PREFIX = 'room:';
 const DISCUSSION_SECONDS = Number(process.env.GAME_TIMER_SECONDS || 60);
@@ -10,10 +11,8 @@ const MIN_PLAYERS = Number(process.env.MIN_PLAYERS || 2);
 
 const onlineSockets = new Map();
 const userSockets = new Map();
-const roomStates = new Map();
 const timers = new Map();
 const phaseTimeouts = new Map();
-const resolvingRooms = new Set();
 const offlineGraceTimers = new Map();
 
 let io;
@@ -46,8 +45,6 @@ function emptyState(roomId) {
     phase: 'waiting',
     scenario: null,
     timer: 0,
-    votes: new Map(),
-    ready: new Map(),
     members: [],
     hostId: null,
     lastResult: null,
@@ -56,13 +53,18 @@ function emptyState(roomId) {
   };
 }
 
-function getState(roomId) {
+async function getState(roomId) {
   const id = Number(roomId);
-  if (!roomStates.has(id)) roomStates.set(id, emptyState(id));
-  return roomStates.get(id);
+  let state = await RoomStateManager.getState(id);
+  if (!state) {
+    state = emptyState(id);
+    await RoomStateManager.setState(id, state);
+  }
+  return state;
 }
 
-function serializeVotes(votes) {
+async function serializeVotes(roomId) {
+  const votes = await RoomStateManager.getVotes(roomId);
   const tally = {};
   const byUser = {};
   for (const [userId, choiceId] of votes.entries()) {
@@ -72,8 +74,12 @@ function serializeVotes(votes) {
   return { byUser, tally };
 }
 
-function serializeState(state, userId = null) {
-  const votes = serializeVotes(state.votes);
+async function serializeState(roomId, userId = null) {
+  const state = await getState(roomId);
+  const votes = await serializeVotes(roomId);
+  const ready = await RoomStateManager.getReady(roomId);
+  const userVotes = await RoomStateManager.getVotes(roomId);
+  
   return {
     roomId: state.roomId,
     phase: state.phase,
@@ -81,9 +87,9 @@ function serializeState(state, userId = null) {
     timer: state.timer,
     members: state.members,
     hostId: state.hostId,
-    ready: Object.fromEntries(state.ready),
+    ready: Object.fromEntries(ready),
     votes,
-    myVote: userId ? state.votes.get(userId) || null : null,
+    myVote: userId ? userVotes.get(userId) || null : null,
     lastResult: state.lastResult,
     ending: state.ending,
     startedAt: state.startedAt,
@@ -124,10 +130,14 @@ async function hydrateState(roomId) {
   const room = await getRoom(roomId);
   if (!room) return null;
 
-  const state = getState(roomId);
+  const state = await getState(roomId);
   state.hostId = room.host_id;
   state.members = await getMembers(roomId);
-  state.ready = new Map(state.members.map((member) => [member.id, Number(member.is_ready) === 1]));
+  
+  // Sync ready status from DB to Redis
+  for (const member of state.members) {
+    await RoomStateManager.setReady(roomId, member.id, Number(member.is_ready) === 1);
+  }
 
   if (!state.scenario && room.current_scenario_id) {
     state.scenario = await loadScenario(room.current_scenario_id);
@@ -142,19 +152,22 @@ async function hydrateState(roomId) {
     state.phase = 'waiting';
   }
 
+  await RoomStateManager.setState(roomId, state);
   return state;
 }
 
 async function broadcastState(roomId, eventName = 'update_story_state') {
   const state = await hydrateState(roomId);
   if (!state) return;
-  io.to(roomName(roomId)).emit(eventName, serializeState(state));
+  const serialized = await serializeState(roomId);
+  io.to(roomName(roomId)).emit(eventName, serialized);
 }
 
 async function emitRoomPresence(roomId) {
   const state = await hydrateState(roomId);
   if (!state) return;
-  io.to(roomName(roomId)).emit('room_state', serializeState(state));
+  const serialized = await serializeState(roomId);
+  io.to(roomName(roomId)).emit('room_state', serialized);
 }
 
 function clearRoomTimer(roomId) {
@@ -175,13 +188,14 @@ async function startRoomTimer(roomId, duration, onExpire) {
     clearInterval(timers.get(id));
     timers.delete(id);
   }
-  const state = getState(id);
+  const state = await getState(id);
   state.timer = duration;
+  await RoomStateManager.setState(id, state);
   await db.execute('UPDATE rooms SET game_timer = ? WHERE id = ?', [duration, id]).catch(() => {});
   io.to(roomName(id)).emit('update_timer', { roomId: id, remaining: duration });
 
   const interval = setInterval(async () => {
-    const current = getState(id);
+    const current = await getState(id);
     if (!current || !['discussion_phase', 'voting_phase'].includes(current.phase)) {
       clearInterval(interval);
       timers.delete(id);
@@ -189,6 +203,7 @@ async function startRoomTimer(roomId, duration, onExpire) {
     }
 
     current.timer = Math.max(0, current.timer - 1);
+    await RoomStateManager.setState(id, current);
     io.to(roomName(id)).emit('update_timer', { roomId: id, remaining: current.timer });
     if (current.timer % 5 === 0 || current.timer <= 3) {
       await db.execute('UPDATE rooms SET game_timer = ? WHERE id = ?', [current.timer, id]).catch(() => {});
@@ -216,24 +231,28 @@ function schedulePhase(roomId, delayMs, fn) {
 
 async function startDiscussion(roomId) {
   const id = Number(roomId);
-  const state = getState(id);
+  const state = await getState(id);
   if (!state.scenario || state.phase === 'ended') return;
   state.phase = 'discussion_phase';
   state.timer = DISCUSSION_SECONDS;
+  await RoomStateManager.setState(id, state);
   await db.execute('UPDATE rooms SET game_timer = ? WHERE id = ?', [DISCUSSION_SECONDS, id]).catch(() => {});
-  io.to(roomName(id)).emit('update_story_state', serializeState(state));
+  const serialized = await serializeState(id);
+  io.to(roomName(id)).emit('update_story_state', serialized);
   await startRoomTimer(id, DISCUSSION_SECONDS, () => startVoting(id));
 }
 
 async function startVoting(roomId) {
   const id = Number(roomId);
-  const state = getState(id);
+  const state = await getState(id);
   if (!state.scenario || state.phase === 'ended') return;
   state.phase = 'voting_phase';
   state.timer = VOTING_SECONDS;
-  state.votes = new Map();
+  await RoomStateManager.setState(id, state);
+  await RoomStateManager.clearVotes(id);
   await db.execute('UPDATE rooms SET game_timer = ? WHERE id = ?', [VOTING_SECONDS, id]).catch(() => {});
-  io.to(roomName(id)).emit('update_story_state', serializeState(state));
+  const serialized = await serializeState(id);
+  io.to(roomName(id)).emit('update_story_state', serialized);
   await startRoomTimer(id, VOTING_SECONDS, () => resolveVotes(id, state.scenario.id));
 }
 
@@ -246,8 +265,9 @@ async function transferHostIfNeeded(roomId, leavingUserId) {
   if (!nextHost) return null;
 
   await db.execute('UPDATE rooms SET host_id = ? WHERE id = ?', [nextHost.id, roomId]);
-  const state = getState(roomId);
+  const state = await getState(roomId);
   state.hostId = nextHost.id;
+  await RoomStateManager.setState(roomId, state);
   io.to(roomName(roomId)).emit('host_changed', { roomId, hostId: nextHost.id, host: nextHost });
   return nextHost.id;
 }
@@ -264,10 +284,12 @@ function buildBreakdown(choices, votes, winnerChoice) {
 }
 
 async function finishGame(roomId, scenario, winnerText = null) {
-  const state = getState(roomId);
+  const state = await getState(roomId);
   state.phase = 'ended';
   state.ending = scenario;
   state.timer = 0;
+  state.endedAt = new Date().toISOString();
+  await RoomStateManager.setState(roomId, state);
   clearRoomTimer(roomId);
 
   await db.execute(
@@ -275,7 +297,8 @@ async function finishGame(roomId, scenario, winnerText = null) {
     [scenario.id, roomId]
   ).catch(() => {});
 
-  const voters = [...state.votes.keys()];
+  const votes = await RoomStateManager.getVotes(roomId);
+  const voters = [...votes.keys()];
   for (const userId of voters) {
     await db.execute(
       'UPDATE users SET reputation = reputation + 10, trust_score = LEAST(200, trust_score + 2) WHERE id = ?',
@@ -283,8 +306,9 @@ async function finishGame(roomId, scenario, winnerText = null) {
     ).catch(() => {});
   }
 
+  const serialized = await serializeState(roomId);
   const payload = {
-    ...serializeState(state),
+    ...serialized,
     ending: scenario,
     winnerText,
   };
@@ -294,15 +318,31 @@ async function finishGame(roomId, scenario, winnerText = null) {
 
 async function resolveVotes(roomId, scenarioId) {
   const id = Number(roomId);
-  if (resolvingRooms.has(id)) return;
-  resolvingRooms.add(id);
+  const lockKey = `lock:resolve:${id}`;
+  let lock;
+
+  try {
+    // Acquire distributed lock (10 second TTL)
+    lock = await redlock.acquire([lockKey], 10000);
+    console.log(`🔒 Lock acquired for room ${id}`);
+  } catch (err) {
+    // Another process is already resolving
+    console.log(`⏭️  Room ${id} already being resolved, skipping`);
+    return;
+  }
+
   clearRoomTimer(id);
 
   try {
-    const state = getState(id);
-    if (!state.scenario || state.scenario.id !== Number(scenarioId)) return;
+    const state = await getState(id);
+    if (!state.scenario || state.scenario.id !== Number(scenarioId)) {
+      console.log(`⚠️  Scenario mismatch for room ${id}`);
+      return;
+    }
 
     state.phase = 'result_phase';
+    await RoomStateManager.setState(id, state);
+    
     const [choices] = await db.execute(
       'SELECT * FROM scenario_choices WHERE scenario_id = ? ORDER BY id ASC',
       [scenarioId]
@@ -312,14 +352,16 @@ async function resolveVotes(roomId, scenarioId) {
       return;
     }
 
-    const tally = serializeVotes(state.votes).tally;
+    const votes = await RoomStateManager.getVotes(id);
+    const tallyData = await serializeVotes(id);
+    const tally = tallyData.tally;
     let winner = choices[0];
     const sorted = Object.entries(tally).sort(([, a], [, b]) => b - a);
     if (sorted.length > 0) {
       winner = choices.find((choice) => choice.id === Number(sorted[0][0])) || choices[0];
     }
 
-    const breakdown = buildBreakdown(choices, state.votes, winner);
+    const breakdown = buildBreakdown(choices, votes, winner);
     state.lastResult = {
       roomId: id,
       scenarioId,
@@ -327,19 +369,22 @@ async function resolveVotes(roomId, scenarioId) {
       winnerText: winner.text,
       breakdown,
     };
+    await RoomStateManager.setState(id, state);
 
-    for (const [userId, choiceId] of state.votes.entries()) {
+    for (const [userId, choiceId] of votes.entries()) {
       await db.execute(
         'INSERT IGNORE INTO votes (user_id, choice_id, points_earned) VALUES (?, ?, ?)',
         [userId, choiceId, choiceId === winner.id ? 15 : 5]
       ).catch(() => {});
     }
 
+    const votesSerialized = await serializeVotes(id);
     io.to(roomName(id)).emit('vote_decision', {
       ...state.lastResult,
-      votes: serializeVotes(state.votes),
+      votes: votesSerialized,
     });
-    io.to(roomName(id)).emit('update_story_state', serializeState(state));
+    const serialized = await serializeState(id);
+    io.to(roomName(id)).emit('update_story_state', serialized);
 
     await new Promise((resolve) => setTimeout(resolve, 1800));
 
@@ -350,18 +395,20 @@ async function resolveVotes(roomId, scenarioId) {
     }
 
     state.scenario = nextScenario;
-    state.votes = new Map();
     state.lastResult = null;
     state.phase = nextScenario.is_end ? 'ended' : 'story_intro';
     state.timer = nextScenario.is_end ? 0 : INTRO_SECONDS;
+    await RoomStateManager.setState(id, state);
+    await RoomStateManager.clearVotes(id);
 
     await db.execute(
       'UPDATE rooms SET current_scenario_id = ?, game_timer = ?, status = ? WHERE id = ?',
       [nextScenario.id, state.timer, nextScenario.is_end ? 'closed' : 'active', id]
     ).catch(() => {});
 
+    const payloadSerialized = await serializeState(id);
     const payload = {
-      ...serializeState(state),
+      ...payloadSerialized,
       prevChoice: winner.text,
     };
     io.to(roomName(id)).emit('next_story', payload);
@@ -370,9 +417,17 @@ async function resolveVotes(roomId, scenarioId) {
     if (nextScenario.is_end) await finishGame(id, nextScenario, winner.text);
     else schedulePhase(id, INTRO_SECONDS * 1000, () => startDiscussion(id));
   } catch (err) {
-    console.error('resolveVotes error:', err);
+    console.error('❌ resolveVotes error:', err);
   } finally {
-    resolvingRooms.delete(id);
+    // Always release lock
+    if (lock) {
+      try {
+        await lock.release();
+        console.log(`🔓 Lock released for room ${id}`);
+      } catch (err) {
+        console.error(`⚠️  Failed to release lock for room ${id}:`, err.message);
+      }
+    }
   }
 }
 
@@ -453,14 +508,16 @@ async function initSocket(server) {
       }
 
       const state = await hydrateState(id);
+      const stateSerialized = await serializeState(id);
       io.to(roomName(id)).emit('user_join', {
         roomId: id,
         userId,
         username,
         avatar,
-        state: serializeState(state),
+        state: stateSerialized,
       });
-      socket.emit('update_story_state', serializeState(state, userId));
+      const userStateSerialized = await serializeState(id, userId);
+      socket.emit('update_story_state', userStateSerialized);
       await emitRoomPresence(id);
     };
 
@@ -474,10 +531,11 @@ async function initSocket(server) {
         'UPDATE room_members SET left_at = NOW(), is_ready = 0 WHERE room_id = ? AND user_id = ? AND left_at IS NULL',
         [id, userId]
       ).catch(() => {});
-      const state = getState(id);
+      const state = await getState(id);
       state.members = await getMembers(id);
-      state.ready.delete(userId);
-      state.votes.delete(userId);
+      await RoomStateManager.setState(id, state);
+      await RoomStateManager.setReady(id, userId, false);
+      await RoomStateManager.setVote(id, userId, null);
       await transferHostIfNeeded(id, userId);
       io.to(roomName(id)).emit('user_leave', { roomId: id, userId, username });
       await emitRoomPresence(id);
@@ -490,14 +548,16 @@ async function initSocket(server) {
         'UPDATE room_members SET is_ready = ? WHERE room_id = ? AND user_id = ? AND left_at IS NULL',
         [isReady ? 1 : 0, id, userId]
       ).catch(() => {});
+      await RoomStateManager.setReady(id, userId, isReady);
       const state = await hydrateState(id);
+      const stateSerialized = await serializeState(id);
       io.to(roomName(id)).emit('ready_update', {
         roomId: id,
         userId,
         ready: isReady,
-        state: serializeState(state),
+        state: stateSerialized,
       });
-      io.to(roomName(id)).emit('update_story_state', serializeState(state));
+      io.to(roomName(id)).emit('update_story_state', stateSerialized);
     };
 
     const sendMessage = async ({ roomId, content, clientMessageId }) => {
@@ -543,33 +603,35 @@ async function initSocket(server) {
       if (!start) return socket.emit('socket_error', { message: 'No start scenario found' });
 
       const scenario = await loadScenario(start.id);
-      const state = getState(id);
+      const state = await getState(id);
       state.hostId = userId;
       state.members = await getMembers(id);
       state.scenario = scenario;
       state.phase = 'story_intro';
-      state.votes = new Map();
       state.timer = INTRO_SECONDS;
       state.startedAt = new Date().toISOString();
       state.ending = null;
       state.lastResult = null;
+      await RoomStateManager.setState(id, state);
+      await RoomStateManager.clearVotes(id);
 
       await db.execute(
         'UPDATE rooms SET status = "active", current_scenario_id = ?, game_timer = ?, started_at = NOW(), ended_at = NULL WHERE id = ?',
         [scenario.id, INTRO_SECONDS, id]
       );
 
+      const stateSerialized = await serializeState(id);
       io.to(roomName(id)).emit('start_game', {
-        ...serializeState(state),
+        ...stateSerialized,
         startedBy: { userId, username },
       });
-      io.to(roomName(id)).emit('update_story_state', serializeState(state));
+      io.to(roomName(id)).emit('update_story_state', stateSerialized);
       schedulePhase(id, INTRO_SECONDS * 1000, () => startDiscussion(id));
     };
 
     const voteDecision = async ({ roomId, scenarioId, choiceId }) => {
       const id = Number(roomId);
-      const state = getState(id);
+      const state = await getState(id);
       if (state.phase !== 'voting_phase') return socket.emit('socket_error', { message: 'Voting is closed' });
       if (!state.scenario || Number(scenarioId) !== state.scenario.id) {
         return socket.emit('socket_error', { message: 'Story state mismatch' });
@@ -577,8 +639,8 @@ async function initSocket(server) {
       const choiceExists = state.scenario.choices.some((choice) => choice.id === Number(choiceId));
       if (!choiceExists) return socket.emit('socket_error', { message: 'Invalid choice' });
 
-      state.votes.set(userId, Number(choiceId));
-      const votes = serializeVotes(state.votes);
+      await RoomStateManager.setVote(id, userId, Number(choiceId));
+      const votes = await serializeVotes(id);
       io.to(roomName(id)).emit('vote_decision', {
         roomId: id,
         scenarioId: state.scenario.id,
@@ -588,9 +650,11 @@ async function initSocket(server) {
         votes,
         totalVoters: state.members.length,
       });
-      io.to(roomName(id)).emit('update_story_state', serializeState(state));
+      const stateSerialized = await serializeState(id);
+      io.to(roomName(id)).emit('update_story_state', stateSerialized);
 
-      if (state.members.length > 0 && state.votes.size >= state.members.length) {
+      const currentVotes = await RoomStateManager.getVotes(id);
+      if (state.members.length > 0 && currentVotes.size >= state.members.length) {
         await resolveVotes(id, state.scenario.id);
       }
     };
@@ -599,7 +663,8 @@ async function initSocket(server) {
       const id = Number(roomId);
       const state = await hydrateState(id);
       if (!state) return;
-      socket.emit('update_story_state', serializeState(state, userId));
+      const stateSerialized = await serializeState(id, userId);
+      socket.emit('update_story_state', stateSerialized);
     };
 
     socket.on('user_join', joinRoom);

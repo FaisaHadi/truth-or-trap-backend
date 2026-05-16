@@ -1,5 +1,6 @@
 const db   = require('../config/db');
 const { v4: uuidv4 } = require('uuid');
+const bcrypt = require('bcryptjs');
 
 // GET /api/rooms
 const getRooms = async (req, res) => {
@@ -58,10 +59,16 @@ const createRoom = async (req, res) => {
     const { name, news_id, max_players, is_private, password } = req.body;
     const roomCode = uuidv4().substring(0, 8).toUpperCase();
 
+    // Hash password if room is private
+    let hashedPassword = null;
+    if (is_private && password) {
+      hashedPassword = await bcrypt.hash(password, 10);
+    }
+
     const [result] = await db.execute(
       `INSERT INTO rooms (name, code, host_id, news_id, max_players, is_private, password, status)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting')`,
-      [name, roomCode, req.user.id, news_id || null, max_players || 10, is_private ? 1 : 0, password || null]
+      [name, roomCode, req.user.id, news_id || null, max_players || 10, is_private ? 1 : 0, hashedPassword]
     );
 
     // Host joins automatically
@@ -78,12 +85,24 @@ const joinRoom = async (req, res) => {
   try {
     const roomId = req.params.id;
     const userId = req.user.id;
+    const { password } = req.body; // Password from request body
 
     const [rooms] = await db.execute('SELECT * FROM rooms WHERE id = ?', [roomId]);
     if (rooms.length === 0) return res.status(404).json({ success: false, message: 'Room not found' });
     const room = rooms[0];
 
     if (room.status === 'closed') return res.status(400).json({ success: false, message: 'Room is closed' });
+
+    // Check password for private rooms
+    if (room.is_private && room.password) {
+      if (!password) {
+        return res.status(401).json({ success: false, message: 'Password required' });
+      }
+      const passwordMatch = await bcrypt.compare(password, room.password);
+      if (!passwordMatch) {
+        return res.status(401).json({ success: false, message: 'Incorrect password' });
+      }
+    }
 
     // Check if already in room
     const [existing] = await db.execute(

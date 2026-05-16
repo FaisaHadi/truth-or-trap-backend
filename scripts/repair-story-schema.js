@@ -2,9 +2,21 @@ require('dotenv').config();
 const db = require('../src/config/db');
 
 async function hasColumn(table, column) {
-  const safeTable = table.replace(/[^a-zA-Z0-9_]/g, '');
-  const safeColumn = column.replace(/'/g, "''");
-  const [rows] = await db.query(`SHOW COLUMNS FROM ${safeTable} LIKE '${safeColumn}'`);
+  // Whitelist validation for table names (no special chars allowed)
+  const tableWhitelist = /^[a-zA-Z0-9_]+$/;
+  if (!tableWhitelist.test(table)) {
+    throw new Error(`Invalid table name: ${table}`);
+  }
+  
+  // Use prepared statement with INFORMATION_SCHEMA (safer than SHOW COLUMNS)
+  const [rows] = await db.execute(
+    `SELECT COLUMN_NAME 
+     FROM INFORMATION_SCHEMA.COLUMNS 
+     WHERE TABLE_SCHEMA = DATABASE() 
+       AND TABLE_NAME = ? 
+       AND COLUMN_NAME = ?`,
+    [table, column]
+  );
   return rows.length > 0;
 }
 

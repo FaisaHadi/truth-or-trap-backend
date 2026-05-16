@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const { apiLimiter } = require('./middleware/rateLimit.middleware');
 const app = express();
 
 // Middleware
@@ -9,6 +10,9 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Apply rate limiting to all API routes
+app.use('/api/', apiLimiter);
 
 // Routes
 app.use('/api/auth',    require('./routes/auth.routes'));
