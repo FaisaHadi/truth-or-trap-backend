@@ -437,7 +437,11 @@ async function canStart(roomId, userId) {
   if (state.hostId !== userId) return { ok: false, message: 'Only the host can start the game' };
   if (state.phase !== 'waiting') return { ok: false, message: 'Game already started' };
   if (state.members.length < MIN_PLAYERS) return { ok: false, message: `Minimum ${MIN_PLAYERS} players required` };
-  const allReady = state.members.every((member) => state.ready.get(member.id));
+  
+  // ✅ FIX: Get ready status from Redis instead of state.ready
+  const ready = await RoomStateManager.getReady(roomId);
+  const allReady = state.members.every((member) => ready.get(member.id) === true);
+  
   if (!allReady) return { ok: false, message: 'All players must be ready' };
   return { ok: true, state };
 }
